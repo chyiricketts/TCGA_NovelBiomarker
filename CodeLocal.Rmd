@@ -1,0 +1,262 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+Code for assignment
+
+```{bash}
+#cohort: TCGA Lung Adenocarcinoma (LUAD)
+
+#gene expression RNAseq
+wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LUAD.sampleMap%2FHiSeqV2.gz
+mv TCGA.LUAD.sampleMap%2FHiSeqV2.gz RNAseq.gz
+gunzip RNAseq.gz
+
+#Methylation Data
+wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LUAD.sampleMap%2FHumanMethylation27.gz
+mv TCGA.LUAD.sampleMap%2FHumanMethylation27.gz methylation.gz
+gunzip methylation.gz
+
+#Copy Number Variation
+wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LUAD.sampleMap%2FGistic2_CopyNumber_Gistic2_all_data_by_genes.gz
+mv TCGA.LUAD.sampleMap%2FGistic2_CopyNumber_Gistic2_all_data_by_genes.gz CNV.gz
+gunzip CNV.gz
+
+#Curated survival data (n=641) TCGA Hub
+wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/survival%2FLUAD_survival.txt
+mv survival%2FLUAD_survival.txt survival.txt
+
+# Clinical data
+wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LUAD.sampleMap%2FLUAD_clinicalMatrix
+mv TCGA.LUAD.sampleMap%2FLUAD_clinicalMatrix clinic.txt
+```
+
+
+```{r}
+library(survival)
+```
+
+
+```{r}
+setwd("/rds/general/user/cr725/home/Assignment!")
+
+# Looking at RNA-seq data
+rna.data <- read.table("RNAseq", sep="\t", header=T, row.names=1)
+rna.data <- as.matrix(rna.data)
+dim(rna.data)
+rna.data[1:3,1:3]
+
+# Methylation data
+methyl.data <- read.table("methylation", sep="\t", header=T, row.names=1)
+methyl.data <- as.matrix(methyl.data)
+dim(methyl.data)
+methyl.data[1:3,1:3]
+
+# Copy Number Variation Data
+cnv.data <- read.table("CNV", sep="\t", header=T, row.names=1)
+cnv.data <- as.matrix(cnv.data)
+dim(cnv.data)
+cnv.data[1:3,1:3]
+
+# Survival data
+surv.data <- read.table("survival.txt", sep="\t", header=T, row.names=1)
+rownames(surv.data) <- gsub("-", ".", rownames(surv.data))
+dim(surv.data)
+surv.data[1:3,1:3]
+
+# Clinical data
+clin.data <- read.table("clinic.txt", sep="\t", header=TRUE, row.names=1)
+rownames(clin.data) <- gsub("-", ".", rownames(clin.data))
+clin.data[1:3,1:3]
+```
+
+```{r}
+# Work on diminishing the dataset by all 4 types or choose 1 or two to focus on
+# For now, keeping just RNAseq data and survival data cause that makes most sense for biomarker identification
+
+common.samples <- intersect(colnames(rna.data), rownames(surv.data))
+#common.samples <- intersect(colnames(rna.data), colnames(methyl.data))
+#common.samples <- intersect(colnames(rna.data), colnames(cnv.data))
+
+# RNA data stays the same size
+dim(rna.data)
+rna.data.common  <- rna.data[, common.samples]
+dim(rna.data.common)
+
+# Survival data diminished by some
+dim(surv.data)
+surv.data.common <- surv.data[common.samples, ]
+dim(surv.data.common)
+
+# They use clinical data as well but I don't have that
+```
+
+
+Cox Proportional Survival Object
+```{r}
+# Create survival object
+# Use colnames(rna.data) so the information is ordered in the same way
+os.time <- surv.data[colnames(rna.data), "OS.time"]
+os.event <- as.numeric(surv.data[colnames(rna.data), "OS"])
+# This runs the actual survival event
+cesc.os <- Surv(os.time, os.event)
+```
+
+```{r}
+#Example: Single Cox model on the first gene
+coxph(cesc.os ~ rna.data[1,])
+```
+
+
+```{r}
+# This is the method that James uses to make results.univariate
+# It creates a matrix that may be slightly faster computationally
+# James puts it into a data frame later on. 
+results.univariate2 <- array(NA, c(nrow(rna.data), 4))
+colnames(results.univariate) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.univariate) <- rownames(rna.data)
+```
+
+
+```{r}
+# This is the method Kyle uses to make results.univariate
+# It creates a data fram that has a nicer output
+# I will use this methood for now and keep it in the meantime since I would like to look and ananlyze the outputs of results univariate more easily
+n <- nrow(rna.data)
+results.univariate <- data.frame(
+  HR   = rep(NA_real_, n),
+  LCI  = rep(NA_real_, n),
+  UCI  = rep(NA_real_, n),
+  PVAL = rep(NA_real_, n),
+  row.names = rownames(rna.data)
+)
+```
+
+
+```{r}
+# For loop to populate results.univariate2
+# Kyle's method - does the same thing but doesn't have the nice rownames
+for(i in 1:nrow(rna.data)) {
+  coxphmodel <- coxph(cesc.os ~ as.numeric(rna.data[i,]))
+  s <- summary(coxphmodel)
+  results.univariate2[i,] <- c(s$coef[1,2], s$conf.int[1,3:4], s$coef[1,5])
+}
+
+```
+
+```{r}
+# James' method. A bit slower computationally but does the same thing
+# has nice rownames
+for(i in 1:nrow(rna.data)) {
+  coxphmodel <- coxph(cesc.os ~ as.numeric(rna.data[i,]))
+  results.univariate$HR[i] <- summary(coxphmodel)$coef[1,2]
+  results.univariate$LCI[i] <- summary(coxphmodel)$conf.int[1,3]
+  results.univariate$UCI[i] <- summary(coxphmodel)$conf.int[1,4]
+  results.univariate$PVAL[i] <- summary(coxphmodel)$coef[1,5]
+}
+```
+
+```{r}
+# Adjust p-values using FDR
+results.univariate$FDR <- p.adjust(results.univariate$PVAL, method="fdr")
+```
+
+```{r}
+# Sort by significance
+results.univariate <- results.univariate[order(results.univariate$FDR),]
+
+# James addds the order decreasing but it is the default so it is not needed. 
+results.univariate <-results.univariate[order(results.univariate$FDR, decreasing=F),]
+```
+
+
+```{r}
+# James and Kyle's methods respectively, they do the same things
+results.univariate[1:10,]
+head(results.univariate, 10)
+```
+
+```{r}
+# Kyle uses clinical data throughout to see the correlations but this dataset does not really have any clinical data. It can be skipped but it may be difficult to identify
+```
+
+
+```{r}
+# Looking at the top candidates
+summary(rna.data["FAM117A",])
+summary(rna.data["BZRAP1",])
+summary(rna.data["PITX3",]) # 0
+summary(rna.data["DKK1",]) # 0
+summary(rna.data["VAX1",]) # 0
+summary(rna.data["PLEKHB1",])
+summary(rna.data["LASS4",])
+summary(rna.data["INPP5J",])
+summary(rna.data["LOC441869",])
+summary(rna.data["SLC25A42",])
+```
+
+
+```{r}
+clin.data$tobacco_smoking_history
+```
+
+
+
+
+```{r}
+# Align clinical and expression data
+clin.data <- clin.data[colnames(rna.data),]
+
+age <- as.numeric(clin.data$age_at_initial_pathologic_diagnosis)
+histology <- as.factor(clin.data$histological_type)
+grade <- clin.data$neoplasm_histologic_grade
+
+# Stage grouping: stage III or IV = high
+stage.high <- rep(0, nrow(clin.data))
+stage.high[grep("III|IV", clin.data$clinical_stage)] <- 1
+
+# Smoking history
+smoke.cat <- rep(NA, nrow(clin.data))
+smoke.cat[clin.data$tobacco_smoking_history == 1] <- 0
+smoke.cat[clin.data$tobacco_smoking_history > 1] <- 1
+summary(coxph(cesc.os ~ smoke.cat))$coef
+
+# Smoking history
+smoke.cat <- rep(NA, nrow(clin.data))
+smoke.cat[clin.data$tobacco_smoking_history < 3] <- 0
+smoke.cat[clin.data$tobacco_smoking_history > 2] <- 1
+summary(coxph(cesc.os ~ smoke.cat))$coef
+
+
+# Smoking history
+smoke.cat <- rep(NA, nrow(clin.data))
+smoke.cat[clin.data$tobacco_smoking_history < 4] <- 0
+smoke.cat[clin.data$tobacco_smoking_history == 4] <- 1
+summary(coxph(cesc.os ~ smoke.cat))$coef
+
+# Test associations
+#summary(coxph(cesc.os ~ age))$coef
+#summary(coxph(cesc.os ~ stage.high))$coef
+```
+
+
+
+
+
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
