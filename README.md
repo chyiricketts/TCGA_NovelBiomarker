@@ -28,7 +28,7 @@ This repository contains R Markdown files, scripts, and data used to investigate
 - Additional R packages for statistical modelling
 
 ### How to Run the Analysis: 
-- Clone the repository: git clone https://github.com/USERNAME/REPOSITORY_NAME.git
+- Clone the repository: git clone https://github.com/chyiricketts/TCGA_NovelBiomarker
 - Open Final_MD.Rmd in RStudio.
 - Install required R packages (listed at the top of the Rmd).
 - Follow comments to download data through command lines. 
