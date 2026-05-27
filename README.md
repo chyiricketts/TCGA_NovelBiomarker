@@ -38,5 +38,5 @@ This repository contains R Markdown files, scripts, and data used to investigate
 This repository is published for viewing, reference, and personal interest only.
 
 ## Author
-Your Name (Chyi / chyiricketts)  
+Chyi Ricketts
 Imperial College London  
