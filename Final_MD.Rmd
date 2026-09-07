@@ -1,0 +1,1408 @@
+---
+title: "Final_MD"
+output: html_document
+date: "2025-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/rds/general/user/cr725/home/Assignment/Assignment_Final")
+```
+
+Loading packages
+```{r load-packages, echo=FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(survival)
+library(pheatmap)
+library(UCSCXenaTools)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(minfi)
+library(limma)
+library(ggplot2)
+```
+
+Downloading data from TCGA in bash
+```{r}
+# All data from TCGA Glioblastoma (GBM)
+
+# RNA Seq from HiSeqV2
+#wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.GBM.sampleMap%2FHiSeqV2.gz
+#mv TCGA.GBM.sampleMap%2FHiSeqV2.gz RNA_ex.gz
+#gunzip RNA_ex.gz
+
+# Methylation Data
+#wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.GBM.sampleMap%2FHumanMethylation450.gz
+#mv TCGA.GBM.sampleMap%2FHumanMethylation450.gz meth_annot.gz
+#gunzip meth_annot.gz
+
+# Curated Clinical Survival
+#wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/survival%2FGBM_survival.txt
+#mv survival%2FGBM_survival.txt survival.txt
+
+# Clinical Data
+#wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.GBM.sampleMap%2FGBM_clinicalMatrix
+#mv TCGA.GBM.sampleMap%2FGBM_clinicalMatrix clinical
+
+# CNV data
+#wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.GBM.sampleMap%2FGistic2_CopyNumber_Gistic2_all_data_by_genes.gz
+#mv TCGA.GBM.sampleMap%2FGistic2_CopyNumber_Gistic2_all_data_by_genes.gz cnv.gz
+#gunzip cnv.gz
+
+# RPPA data
+#wget https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LUAD.sampleMap%2FRPPA.gz
+#mv TCGA.LUAD.sampleMap%2FRPPA.gz RPPA.gz
+#gunzip RPPA.gz
+
+# Additional manual download of RPPA dataset
+# https://tcpa.drbioright.org/rppa500/download.html
+```
+
+
+Read in RNAseq data
+```{r}
+rna.data <- read.table("RNA_ex",
+                       sep = "\t",
+                       head = TRUE,
+                       row.names = 1)
+rna.data <- as.matrix(rna.data)
+
+dim(rna.data)
+rna.data[1:3, 1:3]
+```
+
+Read in methylation data
+```{r}
+meth.data <- read.table("meth_annot",
+                        sep = "\t",
+                        header = TRUE,
+                        row.names = 1)
+meth.data <- as.matrix(meth.data)
+
+dim(meth.data)
+meth.data[1:3, 1:3]
+```
+
+Read in survival data
+```{r}
+surv.data <- read.table("survival.txt",
+                        sep = "\t",
+                        header = T,
+                        row.names = 1)
+rownames(surv.data) <- gsub(rownames(surv.data), pattern = "-", replace =
+                              ".")
+dim(surv.data)
+surv.data[1:3, 1:3]
+```
+
+Read in clinical data
+```{r}
+clin.data <- read.table("clinical",
+                        sep = "\t",
+                        header = T,
+                        row.names = 1)
+rownames(clin.data) <- gsub(rownames(clin.data), pattern = "-", replace =
+                              ".")
+
+dim(clin.data)
+clin.data[1:3, 1:3]
+```
+
+Read in CNV Data
+```{r}
+cnv.data <- read.table("cnv",
+                        sep = "\t",
+                        header = T,
+                        row.names = 1)
+dim(cnv.data)
+cnv.data[1:3, 1:3]
+
+```
+
+Read in RPPA data
+```{r}
+rppa <- as.matrix(read.table(
+  "TCPA_TCGA_RPPA500.tsv",
+  sep = "\t",
+  header = TRUE,
+  row.names = 1
+))
+
+rownames(rppa) <- gsub(rownames(rppa), pattern = "-", replace = ".")
+
+# cutting out the mismatching 'A'
+rownames(rppa) <- substr(rownames(rppa), 1, 15)
+rppa[1:3, 1:3]
+
+```
+
+```{r}
+rppa2 <- as.matrix(read.table(
+  "RPPA",
+  sep = "\t",
+  header = TRUE,
+  row.names = 1
+))
+
+rppa2[1:3, 1:3]
+```
+
+- done reading in data. 
+
+
+Create survival object for downstream analysis
+```{r}
+os.time <- surv.data[colnames(rna.data), "OS.time"]
+
+os.event <- as.numeric(surv.data[colnames(rna.data), "OS"])
+
+cesc.os <- Surv(os.time, os.event)
+
+dim(cesc.os)
+cesc.os[1:3]
+```
+
+Testing fit on a single Cox Proportional Hazards Regression Model
+```{r}
+coxph(cesc.os ~rna.data[1,])
+# high p-value, ~1 coefficient, no value
+```
+
+Fitting univariable model for each gene's expression
+```{r}
+# creating the empty dataframe
+results.univariate <- array(NA, c(nrow(rna.data), 4))
+colnames(results.univariate) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.univariate) <- rownames(rna.data)
+results.univariate <- as.data.frame(results.univariate)
+results.univariate[1:3, ]
+
+# filling the dataframe
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os ~ as.numeric(rna.data[i, ]))
+  results.univariate$HR[i] <- summary(coxphmodel)$coef[1, 2]
+  results.univariate$LCI[i] <- summary(coxphmodel)$conf.int[1, 3]
+  results.univariate$UCI[i] <- summary(coxphmodel)$conf.int[1, 4]
+  results.univariate$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+
+results.univariate["ARSI", ]
+```
+
+Multiple testing correction and viewing the results
+```{r}
+# correction for multiple testing using FDR
+results.univariate$FDR<-p.adjust(results.univariate$PVAL,method="fdr")
+
+# ordering by decreasing fdr value
+results.univariate<-results.univariate[order(results.univariate$FDR, decreasing=F),]
+results.univariate[1:10,]
+```
+
+Looking closely at results
+```{r}
+summary(rna.data["NSUN5",])
+summary(rna.data["LRRC61",])
+summary(rna.data["NKX3-1",])
+summary(rna.data["C21orf96",]) # this one has bad data and old naming convention
+summary(rna.data["RPL39L",])
+summary(rna.data["OR2AG1",]) # bad data
+summary(rna.data["STATH",]) # bad data
+summary(rna.data["DNAJC30",])
+summary(rna.data["OSMR",])
+summary(rna.data["BMPR1A",])
+```
+
+Univariate analysis of each subtype
+```{r}
+#Filtering for just Mesenchymal Gene Expression Profile
+clin.data$GeneExp_Subtype
+clin.data_mes <- clin.data[clin.data$GeneExp_Subtype == "Mesenchymal", ]
+surv.data_mes <- surv.data[rownames(clin.data_mes), ]
+
+os.time_mes <- surv.data_mes[colnames(rna.data), "OS.time"]
+os.event_mes <- as.numeric(surv.data_mes[colnames(rna.data), "OS"])
+cesc.os_mes <- Surv(os.time_mes, os.event_mes)
+dim(cesc.os_mes)
+
+results.univariate_mes <- array(NA, c(nrow(rna.data), 4))
+colnames(results.univariate_mes) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.univariate_mes) <- rownames(rna.data)
+results.univariate_mes <- as.data.frame(results.univariate_mes)
+results.univariate_mes[1:3, ]
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os_mes ~ as.numeric(rna.data[i, ]))
+  results.univariate_mes$HR[i] <- summary(coxphmodel)$coef[1, 2]
+  results.univariate_mes$LCI[i] <- summary(coxphmodel)$conf.int[1, 3]
+  results.univariate_mes$UCI[i] <- summary(coxphmodel)$conf.int[1, 4]
+  results.univariate_mes$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+# correction for multiple testing
+results.univariate_mes$FDR <- p.adjust(results.univariate_mes$PVAL, method = "fdr")
+
+results.univariate_mes <- results.univariate_mes[order(results.univariate_mes$FDR, decreasing =
+                                                 F), ]
+# FDR is false discovery rate
+
+results.univariate_mes[1:10, ]
+results.univariate_mes["ARSI", ]
+```
+
+
+```{r}
+#Filtering for just Classical Gene Expression Profile
+clin.data$GeneExp_Subtype
+clin.data_classic <- clin.data[clin.data$GeneExp_Subtype == "Classical", ]
+surv.data_classic <- surv.data[rownames(clin.data_classic), ]
+
+os.time_classic <- surv.data_classic[colnames(rna.data), "OS.time"]
+os.event_classic <- as.numeric(surv.data_classic[colnames(rna.data), "OS"])
+cesc.os_classic <- Surv(os.time_classic, os.event_classic)
+dim(cesc.os_classic)
+
+
+results.univariate_classic <- array(NA, c(nrow(rna.data), 4))
+colnames(results.univariate_classic) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.univariate_classic) <- rownames(rna.data)
+results.univariate_classic <- as.data.frame(results.univariate_classic)
+results.univariate_classic[1:3, ]
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os_classic ~ as.numeric(rna.data[i, ]))
+  results.univariate_classic$HR[i] <- summary(coxphmodel)$coef[1, 2]
+  results.univariate_classic$LCI[i] <- summary(coxphmodel)$conf.int[1, 3]
+  results.univariate_classic$UCI[i] <- summary(coxphmodel)$conf.int[1, 4]
+  results.univariate_classic$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+# correction for multiple testing
+results.univariate_classic$FDR <- p.adjust(results.univariate_classic$PVAL, method = "fdr")
+
+results.univariate_classic <- results.univariate_classic[order(results.univariate_classic$FDR, decreasing =
+                                                 F), ]
+# FDR is false discovery rate
+
+results.univariate_classic[1:10, ]
+results.univariate_classic["ARSI", ]
+```
+
+
+```{r}
+#Filtering for just Neural Gene Expression Profile
+clin.data$GeneExp_Subtype
+clin.data_neural <- clin.data[clin.data$GeneExp_Subtype == "Neural", ]
+surv.data_neural <- surv.data[rownames(clin.data_neural), ]
+
+os.time_neural <- surv.data_neural[colnames(rna.data), "OS.time"]
+os.event_neural <- as.numeric(surv.data_neural[colnames(rna.data), "OS"])
+cesc.os_neural <- Surv(os.time_neural, os.event_neural)
+dim(cesc.os_neural)
+
+
+results.univariate_neural <- array(NA, c(nrow(rna.data), 4))
+colnames(results.univariate_neural) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.univariate_neural) <- rownames(rna.data)
+results.univariate_neural <- as.data.frame(results.univariate_neural)
+results.univariate_neural[1:3, ]
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os_neural ~ as.numeric(rna.data[i, ]))
+  results.univariate_neural$HR[i] <- summary(coxphmodel)$coef[1, 2]
+  results.univariate_neural$LCI[i] <- summary(coxphmodel)$conf.int[1, 3]
+  results.univariate_neural$UCI[i] <- summary(coxphmodel)$conf.int[1, 4]
+  results.univariate_neural$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+# correction for multiple testing
+results.univariate_neural$FDR <- p.adjust(results.univariate_neural$PVAL, method = "fdr")
+
+results.univariate_neural <- results.univariate_neural[order(results.univariate_neural$FDR, decreasing =
+                                                 F), ]
+# FDR is false discovery rate
+
+results.univariate_neural[1:10, ]
+results.univariate_neural["ARSI", ]
+```
+
+
+```{r}
+#Filtering for just Proneural Gene Expression Profile
+clin.data$GeneExp_Subtype
+clin.data_pro <- clin.data[clin.data$GeneExp_Subtype == "Proneural", ]
+surv.data_pro <- surv.data[rownames(clin.data_pro), ]
+
+os.time_pro <- surv.data_pro[colnames(rna.data), "OS.time"]
+os.event_pro <- as.numeric(surv.data_pro[colnames(rna.data), "OS"])
+cesc.os_pro <- Surv(os.time_pro, os.event_pro)
+dim(cesc.os_pro)
+
+
+results.univariate_pro <- array(NA, c(nrow(rna.data), 4))
+colnames(results.univariate_pro) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.univariate_pro) <- rownames(rna.data)
+results.univariate_pro <- as.data.frame(results.univariate_pro)
+results.univariate_pro[1:3, ]
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os_pro ~ as.numeric(rna.data[i, ]))
+  results.univariate_pro$HR[i] <- summary(coxphmodel)$coef[1, 2]
+  results.univariate_pro$LCI[i] <- summary(coxphmodel)$conf.int[1, 3]
+  results.univariate_pro$UCI[i] <- summary(coxphmodel)$conf.int[1, 4]
+  results.univariate_pro$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+# correction for multiple testing
+results.univariate_pro$FDR <- p.adjust(results.univariate_pro$PVAL, method = "fdr")
+
+results.univariate_pro <- results.univariate_pro[order(results.univariate_pro$FDR, decreasing =
+                                                 F), ]
+# FDR is false discovery rate
+
+results.univariate_pro[1:10, ]
+results.univariate_pro["ARSI", ]
+```
+
+
+
+Exploring Multivariable analysis
+First by exploring the clinical data
+```{r}
+# observing clinical data with correlation to rna expression
+clin.data<-clin.data[colnames(rna.data),]
+clin.data[1:3, 1:3]
+colnames(clin.data)
+
+# age
+age<-as.numeric(clin.data$age_at_initial_pathologic_diagnosis)
+table(age)
+
+# histology
+# would not really work for this data
+histology<-as.factor(clin.data$histological_type)
+table(histology)
+
+# grade (GBMs are always Grade 4)
+# doesn't exist for this
+grade<-clin.data$neoplasm_histologic_grade
+table(grade)
+
+# this would just compare survival to survival
+surv.data2 <- clin.data$CDE_survival_time
+surv.data2 <- as.numeric(surv.data2)
+table(surv.data2)
+
+# gcimp
+# Glioma CpG Island Methylator Phenotype - whether ir shows hypermethylation pattern (+) or not (-)
+gcimp <- clin.data$G_CIMP_STATUS
+table(gcimp)
+
+# Gene Expression subtype
+# Grouped into 4 categories: Classical, Mesenchymal, Neural, and Proneural (and None)
+geneexp_subtype <- clin.data$GeneExp_Subtype
+table(geneexp_subtype)
+```
+
+Testing correlations for clinical data
+```{r}
+# age is significant. with ~2.5% increase HR for each year
+summary(coxph(cesc.os ~ age))$coef  
+
+# histology data isn't organized a lot so it is not significant. not good separation anyway
+summary(coxph(cesc.os ~ histology))$coef
+
+# non gcimp is statistically significant for more risk. but the sample size is very small for g-cimp so I wouldn't trust it
+summary(coxph(cesc.os ~ gcimp))$coef
+
+# Crazy overfitting due to small sample size
+summary(coxph(cesc.os ~ geneexp_subtype))$coef
+```
+
+
+Exploring individual subtypes by isolating them
+```{r}
+x1 <- grep("Classical", clin.data$GeneExp_Subtype)
+type.class <- rep(0, nrow(clin.data))
+type.class[x1] <- 1
+summary(coxph(cesc.os ~ type.class))$coef
+
+# most deadly type
+x1 <- grep("Mesenchymal", clin.data$GeneExp_Subtype)
+type.mes <- rep(0, nrow(clin.data))
+type.mes[x1] <- 1
+summary(coxph(cesc.os ~ type.mes))$coef
+
+x1 <- grep("Neural", clin.data$GeneExp_Subtype)
+type.neural <- rep(0, nrow(clin.data))
+type.neural[x1] <- 1
+summary(coxph(cesc.os ~ type.neural))$coef
+
+x1 <- grep("Proneural", clin.data$GeneExp_Subtype)
+type.pro <- rep(0, nrow(clin.data))
+type.pro[x1] <- 1
+summary(coxph(cesc.os ~ type.pro))$coef
+```
+
+
+Running the multivariate analysis, controlling for age
+```{r}
+results.multivariate <- array(NA, c(nrow(rna.data), 4))
+colnames(results.multivariate) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.multivariate) <- rownames(rna.data)
+results.multivariate <- as.data.frame(results.multivariate)
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os ~ rna.data[i, ] + age)
+  results.multivariate$HR[i] <- summary(coxphmodel)$coef[1, 2]
+  results.multivariate$LCI[i] <- summary(coxphmodel)$conf.int[1, 3]
+  results.multivariate$UCI[i] <- summary(coxphmodel)$conf.int[1, 4]
+  results.multivariate$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+
+results.multivariate<-as.data.frame(results.multivariate)
+```
+
+
+```{r}
+# multiple variable testing correction
+results.multivariate$FDR<-p.adjust(results.multivariate$PVAL,method="fdr")
+
+# viewing the results
+results.multivariate<-results.multivariate[order(results.multivariate$FDR, decreasing=F),]
+results.multivariate[1:10,]
+
+results.multivariate["ARSI", ]
+```
+
+
+```{r}
+# Looking closer at the results
+summary(rna.data["SOAT2",])
+summary(rna.data["STATH",])
+
+results.univariate["SOAT2",]
+results.univariate["STATH",]
+results.univariate["CDC73",]
+results.univariate["GUCA1C",]
+```
+
+
+Running Multivariate analysis for each subtype
+```{r}
+# Filtering for just Mesenchymal Gene Expression Profile
+clin.data_mes <- clin.data[clin.data$GeneExp_Subtype == "Mesenchymal", ]
+surv.data_mes <- surv.data[rownames(clin.data_mes), ]
+
+#rna.data_mes <- rna.data[, rownames(clin.data_mes)]
+
+# extract survival info
+os.time_mes <- surv.data_mes[colnames(rna.data), "OS.time"]
+os.event_mes <- as.numeric(surv.data_mes[colnames(rna.data), "OS"])
+cesc.os_mes <- Surv(os.time_mes, os.event_mes)
+
+# extract AGE aligned to samples
+age_mes <- as.numeric(clin.data_mes[colnames(rna.data),
+                                   "age_at_initial_pathologic_diagnosis"])
+# multivariate (gene + age)
+results.multivariate_mes <- array(NA, c(nrow(rna.data), 4))
+colnames(results.multivariate_mes) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.multivariate_mes) <- rownames(rna.data)
+results.multivariate_mes <- as.data.frame(results.multivariate_mes)
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os_mes ~ rna.data[i, ] + age_mes)
+  results.multivariate_mes$HR[i] <- summary(coxphmodel)$coef[1, 2]
+  results.multivariate_mes$LCI[i] <- summary(coxphmodel)$conf.int[1, 3]
+  results.multivariate_mes$UCI[i] <- summary(coxphmodel)$conf.int[1, 4]
+  results.multivariate_mes$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+
+# multiple testing correction
+results.multivariate_mes$FDR <- p.adjust(results.multivariate_mes$PVAL, method = "fdr")
+
+# order results
+results.multivariate_mes <- results.multivariate_mes[order(results.multivariate_mes$FDR, decreasing = FALSE), ]
+
+# check top results + ARSI
+results.multivariate_mes[1:10, ]
+results.multivariate_mes["ARSI", ]
+
+```
+
+
+```{r}
+# --- Filter for Classical subtype ---
+clin.data_classic <- clin.data[clin.data$GeneExp_Subtype == "Classical", ]
+surv.data_classic <- surv.data[rownames(clin.data_classic), ]
+
+# Extract matching RNA data columns
+#rna.data_classic <- rna.data[, rownames(clin.data_classic)]
+
+# Extract age using correct column
+age_classic <- as.numeric(clin.data_classic[colnames(rna.data),
+                                             "age_at_initial_pathologic_diagnosis"])
+
+# Build Surv object
+os.time_classic  <- surv.data_classic[colnames(rna.data), "OS.time"]
+os.event_classic <- as.numeric(surv.data_classic[colnames(rna.data), "OS"])
+cesc.os_classic  <- Surv(os.time_classic, os.event_classic)
+
+# --- Multivariate Cox: gene + age ---
+results.multivariate_classic <- array(NA, c(nrow(rna.data), 4))
+colnames(results.multivariate_classic) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.multivariate_classic) <- rownames(rna.data)
+results.multivariate_classic <- as.data.frame(results.multivariate_classic)
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os_classic ~ as.numeric(rna.data[i, ]) + age_classic)
+  results.multivariate_classic$HR[i]   <- summary(coxphmodel)$coef[1, 2]
+  results.multivariate_classic$LCI[i]  <- summary(coxphmodel)$conf.int[1, 3]
+  results.multivariate_classic$UCI[i]  <- summary(coxphmodel)$conf.int[1, 4]
+  results.multivariate_classic$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+
+# Multiple-testing correction
+results.multivariate_classic$FDR <- p.adjust(results.multivariate_classic$PVAL, method = "fdr")
+
+# Sort output
+results.multivariate_classic <- results.multivariate_classic[order(results.multivariate_classic$FDR), ]
+
+# View results
+results.multivariate_classic[1:10, ]
+results.multivariate_classic["ARSI", ]
+```
+
+
+```{r}
+# --- Filter for Neural subtype ---
+clin.data_neural <- clin.data[clin.data$GeneExp_Subtype == "Neural", ]
+surv.data_neural <- surv.data[rownames(clin.data_neural), ]
+
+# Extract matching RNA data columns
+#rna.data_neural <- rna.data[, rownames(clin.data_neural)]
+
+# Extract age using correct column
+age_neural <- as.numeric(clin.data_neural[colnames(rna.data),
+                                          "age_at_initial_pathologic_diagnosis"])
+
+# Build Surv object
+os.time_neural  <- surv.data_neural[colnames(rna.data), "OS.time"]
+os.event_neural <- as.numeric(surv.data_neural[colnames(rna.data), "OS"])
+cesc.os_neural  <- Surv(os.time_neural, os.event_neural)
+
+# --- Multivariate Cox: gene + age ---
+results.multivariate_neural <- array(NA, c(nrow(rna.data), 4))
+colnames(results.multivariate_neural) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.multivariate_neural) <- rownames(rna.data)
+results.multivariate_neural <- as.data.frame(results.multivariate_neural)
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os_neural ~ as.numeric(rna.data[i, ]) + age_neural)
+  results.multivariate_neural$HR[i]   <- summary(coxphmodel)$coef[1, 2]
+  results.multivariate_neural$LCI[i]  <- summary(coxphmodel)$conf.int[1, 3]
+  results.multivariate_neural$UCI[i]  <- summary(coxphmodel)$conf.int[1, 4]
+  results.multivariate_neural$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+
+# Multiple-testing correction
+results.multivariate_neural$FDR <- p.adjust(results.multivariate_neural$PVAL, method = "fdr")
+
+# Sort output
+results.multivariate_neural <- results.multivariate_neural[order(results.multivariate_neural$FDR), ]
+
+# View results
+results.multivariate_neural[1:10, ]
+results.multivariate_neural["ARSI", ]
+```
+
+
+```{r}
+# --- Filter for Proneural subtype ---
+clin.data_pro <- clin.data[clin.data$GeneExp_Subtype == "Proneural", ]
+surv.data_pro <- surv.data[rownames(clin.data_pro), ]
+
+# Extract matching RNA data columns
+#rna.data_pro <- rna.data[, rownames(clin.data_pro)]
+
+# Extract age using correct column
+age_pro <- as.numeric(clin.data_pro[colnames(rna.data),
+                                   "age_at_initial_pathologic_diagnosis"])
+
+# Build Surv object
+os.time_pro  <- surv.data_pro[colnames(rna.data), "OS.time"]
+os.event_pro <- as.numeric(surv.data_pro[colnames(rna.data), "OS"])
+cesc.os_pro  <- Surv(os.time_pro, os.event_pro)
+
+# --- Multivariate Cox: gene + age ---
+results.multivariate_pro <- array(NA, c(nrow(rna.data), 4))
+colnames(results.multivariate_pro) <- c("HR", "LCI", "UCI", "PVAL")
+rownames(results.multivariate_pro) <- rownames(rna.data)
+results.multivariate_pro <- as.data.frame(results.multivariate_pro)
+
+for (i in 1:nrow(rna.data))
+{
+  coxphmodel <- coxph(cesc.os_pro ~ as.numeric(rna.data[i, ]) + age_pro)
+  results.multivariate_pro$HR[i]   <- summary(coxphmodel)$coef[1, 2]
+  results.multivariate_pro$LCI[i]  <- summary(coxphmodel)$conf.int[1, 3]
+  results.multivariate_pro$UCI[i]  <- summary(coxphmodel)$conf.int[1, 4]
+  results.multivariate_pro$PVAL[i] <- summary(coxphmodel)$coef[1, 5]
+}
+
+# Multiple-testing correction
+results.multivariate_pro$FDR <- p.adjust(results.multivariate_pro$PVAL, method = "fdr")
+
+# Sort output
+results.multivariate_pro <- results.multivariate_pro[order(results.multivariate_pro$FDR), ]
+
+# View results
+results.multivariate_pro[1:10, ]
+results.multivariate_pro["ARSI", ]
+```
+
+
+
+Boxplot for Each Gene Expression profile's difference in ARSI expression
+```{r}
+arsi_expression <- as.numeric(rna.data["ARSI", ])
+sample_ids <- colnames(rna.data)
+
+subtype <- clin.data[sample_ids, "GeneExp_Subtype"]
+
+valid <- subtype != ""
+arsi_expression <- arsi_expression[valid]
+subtype <- subtype[valid]
+sample_ids <- sample_ids[valid]
+
+arsi_expression_df <- data.frame(
+  Sample = sample_ids,
+  ARSI = arsi_expression,
+  Subtype = factor(subtype, levels = c("Classical","Neural","Proneural","Mesenchymal"))
+)
+
+# Plot
+ggplot(arsi_expression_df, aes(x = Subtype, y = ARSI, fill = Subtype)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "ARSI Expression Across GBM Subtypes",
+    x = "GBM Subtype",
+    y = "ARSI Expression (log2 TPM / FPKM)"
+  ) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+# Saving the same plot
+png("ARSI_ExpressionBySubtype.png")
+ggplot(arsi_expression_df, aes(x = Subtype, y = ARSI, fill = Subtype)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "ARSI Expression Across GBM Subtypes",
+    x = "GBM Subtype",
+    y = "ARSI Expression (log2 TPM / FPKM)"
+  ) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+dev.off()
+
+# Kruskal–Wallis
+kruskal.test(ARSI ~ Subtype, data = arsi_expression_df)
+
+```
+
+
+
+
+
+Drawing KM Plots
+```{r}
+arsi.high <- as.numeric(rna.data["ARSI", ] > median(rna.data["ARSI", ]))
+sum(arsi.high)
+
+png(
+  "CESC_OS_byARSI.png",
+  width = 6,
+  height = 6,
+  units = 'in',
+  res = 300
+)
+
+plot(
+  survfit(cesc.os ~ arsi.high),
+  col = c("black", "red"),
+  lwd = 2,
+  mark.time = TRUE,
+  xlab = "OS time (days)",
+  ylab = "proportion surviving",
+  main = "ARSI in CESC"
+)
+
+legend(
+  "topright",
+  legend = c("ARSI-high", "ARSI-low"),
+  col = c("red", "black"),
+  lwd = 2
+)
+
+
+text(4500, 0.1, "HR=0.49 (95%CI 0.38-0.64)")
+dev.off()
+
+```
+
+
+```{r}
+# for Mesenchymal
+
+common_samples_mes <- intersect(rownames(clin.data_mes), colnames(rna.data))
+rna.data_mes <- rna.data[, common_samples_mes]
+surv.data_mes <- surv.data[common_samples_mes, ]
+
+cesc.os_mes <- Surv(time = surv.data_mes$OS.time,
+                    event = as.numeric(surv.data_mes$OS))
+
+
+arsi.high_mes <- as.numeric(rna.data_mes["ARSI", ] > median(rna.data_mes["ARSI", ]))
+
+png(
+  "CESC2_OS_byARSI.png",
+  width = 6,
+  height = 6,
+  units = 'in',
+  res = 300
+)
+
+plot(
+  survfit(cesc.os_mes ~ arsi.high_mes),
+  col = c("black", "red"),
+  lwd = 2,
+  mark.time = TRUE,
+  xlab = "OS time (days)",
+  ylab = "proportion surviving",
+  main = "ARSI in Mesenchymal"
+)
+
+legend(
+  "topright",
+  legend = c("ARSI-high", "ARSI-low"),
+  col = c("red", "black"),
+  lwd = 2
+)
+
+
+text(4500, 0.1, "HR=0.49 (95%CI 0.38-0.64)")
+dev.off()
+```
+
+```{r}
+# preparing data
+
+common_samples_mes <- intersect(rownames(clin.data_mes), colnames(rna.data))
+rna.data_mes <- rna.data[, common_samples_mes]
+surv.data_mes <- surv.data[common_samples_mes, ]
+cesc.os_mes <- Surv(time = surv.data_mes$OS.time, event = as.numeric(surv.data_mes$OS))
+arsi.high_mes <- as.numeric(rna.data_mes["ARSI", ] > median(rna.data_mes["ARSI", ]))
+
+common_samples_pro <- intersect(rownames(clin.data_pro), colnames(rna.data))
+rna.data_pro <- rna.data[, common_samples_pro]
+surv.data_pro <- surv.data[common_samples_pro, ]
+cesc.os_pro <- Surv(time = surv.data_pro$OS.time, event = as.numeric(surv.data_pro$OS))
+arsi.high_pro <- as.numeric(rna.data_pro["ARSI", ] > median(rna.data_pro["ARSI", ]))
+
+common_samples_neural <- intersect(rownames(clin.data_neural), colnames(rna.data))
+rna.data_neural <- rna.data[, common_samples_neural]
+surv.data_neural <- surv.data[common_samples_neural, ]
+cesc.os_neural <- Surv(time = surv.data_neural$OS.time, event = as.numeric(surv.data_neural$OS))
+arsi.high_neural <- as.numeric(rna.data_neural["ARSI", ] > median(rna.data_neural["ARSI", ]))
+
+common_samples_classic <- intersect(rownames(clin.data_classic), colnames(rna.data))
+rna.data_classic <- rna.data[, common_samples_classic]
+surv.data_classic <- surv.data[common_samples_classic, ]
+cesc.os_classic <- Surv(time = surv.data_classic$OS.time, event = as.numeric(surv.data_classic$OS))
+arsi.high_classic <- as.numeric(rna.data_classic["ARSI", ] > median(rna.data_classic["ARSI", ]))
+```
+
+```{r}
+
+png(
+  "KM_BySubtype_and_Overall.png",
+  width = 12,
+  height = 8,
+  units = "in",
+  res = 300
+)
+
+par(mfrow = c(2, 3))
+
+# overall
+arsi.high <- as.numeric(rna.data["ARSI", ] > median(rna.data["ARSI", ]))
+plot(
+  survfit(cesc.os ~ arsi.high),
+  col = c("black", "red"),
+  lwd = 2,
+  mark.time = TRUE,
+  xlab = "OS (days)",
+  ylab = "Survival",
+  main = "Overall",
+  xlim = c(0, 3000)
+)
+legend(
+  "topright",
+  legend = c("Low", "High"),
+  col = c("black", "red"),
+  lwd = 2
+)
+
+# classical
+arsi.high <- as.numeric(rna.data_classic["ARSI", ] > median(rna.data_classic["ARSI", ]))
+plot(
+  survfit(cesc.os_classic ~ arsi.high_classic),
+  col = c("black", "red"),
+  lwd = 2,
+  mark.time = TRUE,
+  xlab = "OS (days)",
+  ylab = "Survival",
+  main = "Classical",
+  xlim = c(0, 3000)
+)
+legend(
+  "topright",
+  legend = c("Low", "High"),
+  col = c("black", "red"),
+  lwd = 2
+)
+
+# mesenchymal
+arsi.high <- as.numeric(rna.data_mes["ARSI", ] > median(rna.data_mes["ARSI", ]))
+plot(
+  survfit(cesc.os_mes ~ arsi.high_mes),
+  col = c("black", "red"),
+  lwd = 2,
+  mark.time = TRUE,
+  xlab = "OS (days)",
+  ylab = "Survival",
+  main = "Mesenchymal",
+  xlim = c(0, 3000)
+)
+legend(
+  "topright",
+  legend = c("Low", "High"),
+  col = c("black", "red"),
+  lwd = 2
+)
+
+# proneural
+arsi.high <- as.numeric(rna.data_pro["ARSI", ] > median(rna.data_pro["ARSI", ]))
+plot(
+  survfit(cesc.os_pro ~ arsi.high_pro),
+  col = c("black", "red"),
+  lwd = 2,
+  mark.time = TRUE,
+  xlab = "OS (days)",
+  ylab = "Survival",
+  main = "Proneural",
+  xlim = c(0, 3000)
+)
+legend(
+  "topright",
+  legend = c("Low", "High"),
+  col = c("black", "red"),
+  lwd = 2
+)
+
+# neural
+arsi.high <- as.numeric(rna.data_neural["ARSI", ] > median(rna.data_neural["ARSI", ]))
+plot(
+  survfit(cesc.os_neural ~ arsi.high_neural),
+  col = c("black", "red"),
+  lwd = 2,
+  mark.time = TRUE,
+  xlab = "OS (days)",
+  ylab = "Survival",
+  main = "Neural",
+  xlim = c(0, 3000)
+)
+legend(
+  "topright",
+  legend = c("Low", "High"),
+  col = c("black", "red"),
+  lwd = 2
+)
+
+dev.off()
+
+```
+
+
+
+Methylation data
+```{r}
+meth.annot <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+head(meth.annot)
+dim(meth.annot)
+
+# Align samples with RNA
+# making them the same size
+rna.data2  <- rna.data[, colnames(rna.data) %in% colnames(meth.data)]
+meth.data2 <- meth.data[, colnames(meth.data) %in% colnames(rna.data2)]
+surv.data2 <- surv.data[colnames(rna.data2), ]
+
+# Order consistently
+rna.data2  <- rna.data2[,  order(colnames(rna.data2))]
+meth.data2 <- meth.data2[, order(colnames(meth.data2))]
+surv.data2 <- surv.data2[colnames(rna.data2), ]
+
+# Force methylation to numeric matrix
+meth.data2 <- as.matrix(meth.data2)
+storage.mode(meth.data2) <- "numeric"
+
+meth.data2[1:3,1:3]
+surv.data2[1:3,1:3]
+rna.data2[1:3,1:3]
+```
+
+
+
+```{r}
+meth.arsi <- rownames(meth.annot[meth.annot$UCSC_RefGene_Name == "ARSI", ])
+meth.data.arsi <- meth.data2[meth.arsi, ]
+
+# removing 'missingness'
+na.count <- apply(meth.data.arsi, 1, function(x) sum(is.na(x)))
+keep <- na.count <= 0.5 * ncol(meth.data.arsi)
+meth.data.arsi <- meth.data.arsi[keep, ]
+dim(meth.data.arsi)
+
+results <- matrix(NA, nrow = nrow(meth.data.arsi), ncol = 4)
+rownames(results) <- rownames(meth.data.arsi)
+colnames(results) <- c("Cor.ARSI", "Pval.ARSI", "Mean.high.ARSI", "Mean.low.ARSI")
+
+arsi.high <- as.numeric(rna.data2["ARSI", ] > median(as.numeric(rna.data2["ARSI", ])))
+
+# Compute correlation and p-value
+for (i in 1:nrow(meth.data.arsi)) {
+  probe_values <- as.numeric(meth.data.arsi[i, ])
+  test <- cor.test(as.numeric(rna.data2["ARSI", ]), probe_values, use = "complete.obs")
+  
+  results[i, "Cor.ARSI"] <- test$estimate
+  results[i, "Pval.ARSI"] <- test$p.value
+}
+
+# calculate mean high and low expression
+results[, "Mean.high.ARSI"] <- apply(meth.data.arsi[, which(arsi.high == 1), drop = FALSE], 1, mean, na.rm = TRUE)
+results[, "Mean.low.ARSI"]  <- apply(meth.data.arsi[, which(arsi.high == 0), drop = FALSE], 1, mean, na.rm = TRUE)
+
+results
+
+```
+
+First Methylation Probe Scatterplot
+```{r}
+png("ExpVsMeth1.png")
+
+x <- as.numeric(meth.data.arsi["cg12281328", ])
+y <- as.numeric(rna.data2["ARSI", ])
+ct <- cor.test(y, x, use = "complete.obs")
+r_val <- round(ct$estimate, 3)
+p_val <- formatC(ct$p.value, format = "e", digits = 2)
+
+plot(
+  as.numeric(meth.data.arsi["cg12281328", ]),
+  as.numeric(rna.data2["ARSI", ]),
+  main = "ARSI Expression vs cg12281328 Methylation",
+  xlab = "cg12281328",
+  ylab = "ARSI RNAseq"
+)
+abline(lm(rna.data2["ARSI", ] ~ meth.data.arsi["cg12281328", ]))
+
+text(
+  x = min(x, na.rm = TRUE),
+  y = max(y, na.rm = TRUE),
+  labels = paste0("r = ", r_val, "\n", "p = ", p_val),
+  adj = c(0, 1),
+  cex = 1.2,
+  font = 2
+)
+
+dev.off()
+
+
+# repeated to show in console 
+
+plot(
+  as.numeric(meth.data.arsi["cg12281328", ]),
+  as.numeric(rna.data2["ARSI", ]),
+  main = "ARSI Expression vs cg12281328 Methylation",
+  xlab = "cg12281328",
+  ylab = "ARSI RNAseq"
+)
+abline(lm(rna.data2["ARSI", ] ~ meth.data.arsi["cg12281328", ]))
+
+text(
+  x = min(x, na.rm = TRUE),
+  y = max(y, na.rm = TRUE),
+  labels = paste0("r = ", r_val, "\n", "p = ", p_val),
+  adj = c(0, 1),
+  cex = 1.2,
+  font = 2
+)
+
+
+```
+
+
+Making methylation data correlation analysis table
+```{r}
+arsi.cpgs <- rownames(meth.annot[meth.annot$UCSC_RefGene_Name == "ARSI", ])
+meth.data.arsi <- meth.data2[arsi.cpgs, , drop = FALSE]
+
+# removing 'missingness'
+na.count <- apply(meth.data.arsi, 1, function(x) sum(is.na(x)))
+keep <- na.count <= 0.5 * ncol(meth.data.arsi)
+meth.data.arsi <- meth.data.arsi[keep, ]
+
+arsi.high2 <- as.numeric(rna.data2["ARSI", ] > median(rna.data2["ARSI", ]))
+
+results <- data.frame(
+  CpG = rownames(meth.data.arsi),
+  Cor = NA,
+  P = NA,
+  FDR = NA,
+  Slope = NA,
+  Mean_ARSI_High = NA,
+  Mean_ARSI_Low = NA,
+  pos = meth.annot[rownames(meth.data.arsi), "pos"],
+  Relation_to_Island = meth.annot[rownames(meth.data.arsi), "Relation_to_Island"],
+  UCSC_RefGene_Group = meth.annot[rownames(meth.data.arsi), "UCSC_RefGene_Group"],
+  stringsAsFactors = FALSE
+)
+
+# populating dataframe
+for (i in 1:nrow(meth.data.arsi)) {
+
+  meth.vec <- as.numeric(meth.data.arsi[i, ])
+  expr.vec <- as.numeric(rna.data2["ARSI", ])
+
+  ct <- cor.test(expr.vec, meth.vec, use = "complete.obs")
+
+  results$Cor[i]  <- ct$estimate
+  results$P[i]    <- ct$p.value
+
+  lm.model <- lm(expr.vec ~ meth.vec)
+  results$Slope[i] <- coef(lm.model)[2]
+
+  results$Mean_ARSI_High[i] <- mean(meth.vec[arsi.high2 == 1], na.rm = TRUE)
+  results$Mean_ARSI_Low[i]  <- mean(meth.vec[arsi.high2 == 0], na.rm = TRUE)
+}
+
+# multiple testing correction and ordering
+results$FDR <- p.adjust(results$P, method = "fdr")
+results <- results[order(results$FDR), ]
+
+results
+
+```
+
+Plotting boxplot for cg12281328
+```{r}
+# Create a data frame for plotting
+meth_df_12 <- data.frame(
+  Methylation = as.numeric(meth.data.arsi["cg12281328", ]),
+  ARSI_Group = ifelse(as.numeric(rna.data2["ARSI", ]) > median(as.numeric(rna.data2["ARSI", ])), "High", "Low")
+)
+
+# plot with ggplot
+ggplot(meth_df_12, aes(x = ARSI_Group, y = Methylation, fill = ARSI_Group)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(title = "Methylation at cg12281328 by ARSI Expression", x = "ARSI Expression Group", y = "Beta-value (Methylation)") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 12))
+
+# repeated to save to files
+png("Meth_12.png")
+ggplot(meth_df_12, aes(x = ARSI_Group, y = Methylation, fill = ARSI_Group)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(title = "Methylation at cg12281328 by ARSI Expression", x = "ARSI Expression Group", y = "Beta-value (Methylation)") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 12))
+dev.off()
+
+```
+
+Plotting boxplot for cg06873106
+```{r}
+# Create a data frame for plotting
+meth_df_06 <- data.frame(
+  Methylation = as.numeric(meth.data.arsi["cg06873106", ]),
+  ARSI_Group = ifelse(as.numeric(rna.data2["ARSI", ]) > median(as.numeric(rna.data2["ARSI", ])), "High", "Low")
+)
+
+# plot with ggplot
+ggplot(meth_df_06, aes(x = ARSI_Group, y = Methylation, fill = ARSI_Group)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(title = "Methylation at cg06873106 by ARSI Expression", x = "ARSI Expression Group", y = "Beta-value (Methylation)") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 12))
+
+
+# repeated to save to files
+png("Meth_06.png")
+ggplot(meth_df_06, aes(x = ARSI_Group, y = Methylation, fill = ARSI_Group)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(title = "Methylation at cg06873106 by ARSI Expression", x = "ARSI Expression Group", y = "Beta-value (Methylation)") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 12))
+dev.off()
+
+```
+
+Plotting boxplot for cg10941067
+```{r}
+# Create a data frame for plotting
+meth_df_10 <- data.frame(
+  Methylation = as.numeric(meth.data.arsi["cg10941067", ]),
+  ARSI_Group = ifelse(as.numeric(rna.data2["ARSI", ]) > median(as.numeric(rna.data2["ARSI", ])), "High", "Low")
+)
+
+# **REMOVED 4 FAR OUTLIERS <0.5 FOR VISUALIZATION PURPOSES
+meth_df_10_trim <- meth_df_10[meth_df_10$Methylation >= 0.5, ]
+
+
+# plot with ggplot
+ggplot(meth_df_10_trim,
+       aes(x = ARSI_Group, y = Methylation, fill = ARSI_Group)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(title = "Methylation at cg10941067 by ARSI Expression", x = "ARSI Expression Group", y = "Beta-value (Methylation)") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 12))
+
+# repeated to save to files
+png("Meth_10.png")
+ggplot(meth_df_10_trim, aes(x = ARSI_Group, y = Methylation, fill = ARSI_Group)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.7) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(title = "Methylation at cg06873106 by ARSI Expression", x = "ARSI Expression Group", y = "Beta-value (Methylation)") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 12))
+dev.off()
+
+```
+
+
+
+
+
+CNV Analysis
+```{r}
+surv.data[1:3, 1:3]
+cnv.data[1:3, 1:3]
+surv.data$X_PATIENT[1:10]
+
+surv.data_test <- surv.data
+surv.data_test$X_PATIENT <- gsub(surv.data_test$X_PATIENT,
+                                 pattern = "-",
+                                 replace = ".")
+surv.data$X_PATIENT[1:10]
+surv.data_test$X_PATIENT[1:10]
+
+# all this to do this line to change - to . in surv.data_test
+
+table(substring(colnames(cnv.data), 14, 15)) # check all suffixes are .01 so I can make them the same
+
+surv.data_test$sample_long <- paste0(surv.data_test$X_PATIENT, ".01")
+surv.data_test$sample_long[1:10]
+head(colnames(cnv.data), 20)
+
+table(surv.data_test$sample_long %in% colnames(cnv.data))
+
+```
+
+```{r}
+# take out missing samples in the survival data
+matching_samples <- intersect(surv.data_test$sample_long, colnames(cnv.data))
+length(matching_samples)
+csad_vals <- as.numeric(cnv.data["ARSI", matching_samples])
+
+# better way to take out missing samples
+surv.data_filtered <- surv.data_test[surv.data_test$sample_long %in% colnames(cnv.data), ]
+dim(surv.data_filtered)
+```
+
+
+```{r}
+# assumes surv_data$sample matches cnv column names
+csad_vals <- as.numeric(cnv.data["ARSI", surv.data_filtered$sample_long])
+# binary status: amplified vs not (you can change >0 to >=2 for high-level amps only)
+CSAD_status <- ifelse(csad_vals > 0, "Amplified", "NotAmplified")
+# add to survival data
+surv.data_filtered$CSAD_status <- factor(CSAD_status)
+# quick sanity check
+table(surv.data_filtered$CSAD_status, useNA = "ifany")
+# Build survival object
+surv_obj <- Surv(time = surv.data_filtered$OS.time, event = surv.data_filtered$OS)
+# Kaplan–Meier fit and plot (base R)
+fit_csad <- survfit(surv_obj ~ CSAD_status, data = surv.data_filtered)
+
+plot(
+  fit_csad,
+  col   = c("red", "blue"),
+  lty   = 1:2,
+  xlab  = "Time (days)",
+  ylab  = "Overall survival probability",
+  main  = "Overall survival by CSAD CNV status"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(surv.data_filtered$CSAD_status),
+  col    = c("red", "blue"),
+  lty    = 1:2,
+  bty    = "n"
+)
+
+png("CNV_Survival.png")
+plot(
+  fit_csad,
+  col   = c("red", "blue"),
+  lty   = 1:2,
+  xlab  = "Time (days)",
+  ylab  = "Overall survival probability",
+  main  = "Overall survival by CSAD CNV status"
+)
+legend(
+  "bottomleft",
+  legend = levels(surv.data_filtered$CSAD_status),
+  col    = c("red", "blue"),
+  lty    = 1:2,
+  bty    = "n"
+)
+dev.off()
+
+```
+
+
+Heatmap for Spearman associated genes
+1) Mesenchymal associated genes
+2) ECM associated genes
+
+```{r}
+results.univariate["ARSI",]
+```
+
+Panel 1
+```{r}
+results.univariate["CD44",]
+results.univariate["CHI3L1",]
+results.univariate["MET",]
+results.univariate["TGFB1",]
+results.univariate["THBS1",]
+results.univariate["S100A10",]
+results.univariate["S100A11",]
+
+summary(rna.data["CD44",])
+summary(rna.data["CHI3L1",])
+summary(rna.data["TGFB1",])
+summary(rna.data["CD44",])
+summary(rna.data["THBS1",])
+summary(rna.data["CD44",])
+summary(rna.data["CD44",])
+
+```
+
+Panel 2
+```{r}
+results.univariate["COL6A1",]
+results.univariate["COL1A1",]
+results.univariate["FN1",]
+results.univariate["VCAN",]
+results.univariate["MMP2",]
+results.univariate["TIMP1",]
+results.univariate["LAMA4",]
+
+summary(rna.data["COL6A1",])
+summary(rna.data["COL1A1",])
+summary(rna.data["FN1",])
+summary(rna.data["VCAN",])
+summary(rna.data["MMP2",])
+summary(rna.data["TIMP1",])
+summary(rna.data["LAMA4",])
+
+```
+
+
+
+
+
+```{r}
+# Example: using your rna.data matrix
+panel1_genes <- c("ARSI","CD44","CHI3L1","MET","TGFB1","THBS1","S100A10","S100A11")
+panel2_genes <- c("ARSI","COL6A1","COL1A1","FN1","VCAN","MMP2","TIMP1","LAMA4")
+
+expr_panel1 <- t(rna.data[panel1_genes, ])
+expr_panel2 <- t(rna.data[panel2_genes, ])
+
+cor_panel1 <- cor(expr_panel1, method = "spearman")
+cor_panel2 <- cor(expr_panel2, method = "spearman")
+
+
+png("Spearman_ARSIvsGBMMES.png")
+pheatmap(cor_panel1, 
+         cluster_rows = TRUE, cluster_cols = TRUE, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 101),  # ensures -1 = blue, 0 = white, 1 = red
+         main = "Spearman correlation: ARSI vs GBM MES genes")
+dev.off()
+
+png("Spearman_ARSIvsECM.png")
+pheatmap(cor_panel2, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 101),  # ensures -1 = blue, 0 = white, 1 = red
+         main = "Spearman correlation: ARSI vs ECM genes")
+
+dev.off()
+
+```
+
+
+
+Checking if ARSI is in RPPA Dataset
+```{r}
+"ARSI" %in% rownames(rppa2)
+"ANXA2P2" %in% rownames(rppa2)
+"PQLC3" %in% rownames(rppa2)
+"TIMP1" %in% rownames(rppa2)
+"ANXA2" %in% rownames(rppa2)
+```
+
+```{r}
+share_RPPA_RNAseq <- intersect(colnames(rna.data), rownames(rppa))
+share_RPPA_RNAseq[1:3]
+
+cor.design <- cbind(intercept=1, COX2=rna.data["ARSI",share_RPPA_RNAseq])
+cor.fit <- lmFit(rna.data[,share_RPPA_RNAseq],design = cor.design)
+cor.fit <- eBayes(cor.fit)
+topTable(cor.fit,coef = 2, number = 10)
+
+```
+
+
+
+
+
+
